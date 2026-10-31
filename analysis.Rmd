@@ -1,0 +1,179 @@
+---
+title: "Estimating the Effect of a Job-Training Program with Propensity Score Methods"
+author: "Ka Man (Christie) Fung"
+date: "`r format(Sys.Date(), '%B %d, %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    df_print: paged
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE, fig.width = 7, fig.height = 4.5)
+set.seed(2026)
+library(MatchIt)    # matching
+library(cobalt)     # balance diagnostics
+library(dplyr)
+library(ggplot2)
+library(sandwich)   # robust standard errors
+library(lmtest)
+```
+
+## 1. Question
+
+Did participation in a job-training program (the National Supported Work Demonstration) raise participants' **1978 earnings**, compared with similar people who did not participate?
+
+This is a short, reproducible example of a policy-evaluation workflow with observational data: define the estimand, check whether the groups are comparable, adjust with more than one method, and test how much the answer depends on the method.
+
+**Data.** The `lalonde` dataset that ships with the `MatchIt` package (a version of the classic LaLonde 1986 data in which the comparison group comes from a national survey, not a randomized control group). It is public and requires no download.
+
+**Estimand.** The average treatment effect on the treated (ATT): the effect for people who actually took part in the program.
+
+## 2. Data
+
+```{r data}
+data("lalonde", package = "MatchIt")
+dat <- lalonde
+covs <- c("age", "educ", "race", "married", "nodegree", "re74", "re75")
+
+dat %>%
+  group_by(treat) %>%
+  summarise(n = n(),
+            age = mean(age), educ = mean(educ),
+            pct_married = mean(married), pct_nodegree = mean(nodegree),
+            re74 = mean(re74), re75 = mean(re75), re78 = mean(re78))
+```
+
+`treat` = 1 for program participants. `re74`, `re75` and `re78` are earnings in 1974, 1975 (before the program) and 1978 (after it).
+
+## 3. Naive comparison
+
+Simply comparing average 1978 earnings ignores the fact that the groups differ before the program.
+
+```{r naive}
+fit_naive <- lm(re78 ~ treat, data = dat)
+coeftest(fit_naive, vcov = vcovHC(fit_naive, type = "HC3"))
+```
+
+## 4. Are the groups comparable?
+
+Standardized mean differences (SMD) measure imbalance on each covariate. A common rule of thumb is that an absolute SMD below 0.1 indicates good balance.
+
+```{r balance-before}
+bal.tab(treat ~ age + educ + race + married + nodegree + re74 + re75,
+        data = dat, binary = "std", un = TRUE, thresholds = c(m = 0.1))
+```
+
+## 5. Propensity score matching
+
+I estimate propensity scores with logistic regression, then match each treated unit to a control with a close score (1:1 nearest neighbor, caliper of 0.2 standard deviations).
+
+```{r matching}
+m_out <- matchit(treat ~ age + educ + race + married + nodegree + re74 + re75,
+                 data = dat, method = "nearest", distance = "glm",
+                 caliper = 0.2, ratio = 1)
+summary(m_out)$nn
+```
+
+### Overlap
+
+The treated and control groups need overlapping propensity scores. Where they do not overlap, no method can credibly estimate an effect.
+
+```{r overlap}
+ps_df <- data.frame(ps = m_out$distance, treat = factor(dat$treat, labels = c("Control", "Treated")))
+ggplot(ps_df, aes(ps, fill = treat)) +
+  geom_histogram(position = "identity", alpha = 0.5, bins = 30) +
+  labs(x = "Propensity score", y = "Count", fill = NULL,
+       title = "Propensity score overlap (before matching)") +
+  theme_minimal()
+```
+
+### Balance after matching
+
+```{r balance-after}
+love.plot(m_out, binary = "std", thresholds = c(m = 0.1), abs = TRUE,
+          var.order = "unadjusted",
+          title = "Covariate balance before and after matching")
+bal.tab(m_out, binary = "std", thresholds = c(m = 0.1))
+```
+
+Note: 2 were still imbalanced. Will address in limitation.
+
+## 6. Estimating the effect
+
+For the matched sample I use a regression with the covariates included (doubly robust adjustment) and standard errors clustered on matched pair.
+
+```{r effect-match}
+md <- match.data(m_out)
+fit_match <- lm(re78 ~ treat + age + educ + race + married + nodegree + re74 + re75,
+                data = md, weights = weights)
+est_match <- coeftest(fit_match, vcov = vcovCL(fit_match, cluster = md$subclass))
+est_match["treat", ]
+```
+
+## 7. How sensitive is the answer to the method?
+
+A result that holds across reasonable methods is more believable than one that appears under only one specification. I compare four estimates:
+
+1. Naive difference in means
+2. Regression adjustment alone
+3. Propensity score weighting (inverse-probability, ATT weights)
+4. Matching + regression (from above)
+
+```{r robustness}
+# 2. Regression adjustment
+fit_reg <- lm(re78 ~ treat + age + educ + race + married + nodegree + re74 + re75, data = dat)
+est_reg <- coeftest(fit_reg, vcov = vcovHC(fit_reg, type = "HC3"))
+
+# 3. ATT weighting: treated get weight 1, controls get ps / (1 - ps)
+ps_fit <- glm(treat ~ age + educ + race + married + nodegree + re74 + re75,
+              data = dat, family = binomial())
+ps <- fitted(ps_fit)
+dat$w_att <- ifelse(dat$treat == 1, 1, ps / (1 - ps))
+fit_ipw <- lm(re78 ~ treat, data = dat, weights = w_att)
+est_ipw <- coeftest(fit_ipw, vcov = vcovHC(fit_ipw, type = "HC3"))
+
+get_row <- function(label, est) {
+  data.frame(Method = label,
+             Estimate = est["treat", "Estimate"],
+             SE = est["treat", "Std. Error"],
+             Lower95 = est["treat", "Estimate"] - 1.96 * est["treat", "Std. Error"],
+             Upper95 = est["treat", "Estimate"] + 1.96 * est["treat", "Std. Error"])
+}
+
+results <- bind_rows(
+  get_row("Naive difference", coeftest(fit_naive, vcov = vcovHC(fit_naive, type = "HC3"))),
+  get_row("Regression adjustment", est_reg),
+  get_row("ATT weighting", est_ipw),
+  get_row("Matching + regression", est_match)
+)
+results %>% mutate(across(where(is.numeric), ~ round(.x, 0)))
+```
+
+```{r robustness-plot}
+ggplot(results, aes(x = Estimate, y = reorder(Method, Estimate))) +
+  geom_vline(xintercept = 0, linetype = "dashed") +
+  geom_pointrange(aes(xmin = Lower95, xmax = Upper95)) +
+  labs(x = "Estimated effect on 1978 earnings (US dollars, 95% CI)", y = NULL,
+       title = "Treatment effect estimates by method") +
+  theme_minimal()
+```
+
+## 8. Summary
+
+Comparing average earnings directly suggests that participants earned about $635 less than non-participants. This reflects pre-program differences: participants had lower earnings and less education before the program started. After adjusting for these differences with regression, propensity score weighting, and matching, the estimated effect becomes positive, about $1,200 to $1,500 in 1978 earnings. The estimates are consistent across methods, but the uncertainty is large: only the regression estimate has a 95% confidence interval that excludes zero, and the other two intervals include it. The evidence therefore points to a modest positive effect, but it does not rule out no effect. These estimates also rely on the assumption that the measured characteristics capture the important differences between the groups.
+
+## 9. Limitations
+
+- **Unobserved confounding.** Matching and weighting adjust only for the variables measured here. If participants differed on unmeasured traits such as motivation, the estimates could still be biased.
+- **Imbalanced matching.** After matching, seven of nine covariates were balanced (absolute standardized mean difference below 0.1). Marital status (−0.14) and lack of a high school degree (0.16) remained modestly imbalanced; both were included as covariates in the outcome regression to reduce residual bias. The caliper also excluded 72 of 185 treated units for which no close comparison unit was available, so the matching estimate applies to the 113 matched participants and may differ from the effect for all participants.
+- **Positivity.** Estimates are credible only where treated and control units have overlapping propensity scores; see the overlap plot.
+- **Model choice.** Results can depend on the covariates, caliper and weighting scheme. Section 7 is a partial check, not proof of robustness.
+- **Illustration only.** This example shows a workflow on a well-known public dataset. It is not a new evaluation of the original program.
+
+## 10. Reproducibility
+
+```{r session}
+sessionInfo()
+```
